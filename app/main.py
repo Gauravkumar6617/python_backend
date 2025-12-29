@@ -10,6 +10,7 @@ from app.api import exam
 from app.api import stat
 from fastapi.staticfiles import StaticFiles
 import os
+import uvicorn
 app = FastAPI()
 
 app.add_middleware(
@@ -49,3 +50,9 @@ app.include_router(stat.router, prefix="/api/stats", tags=["Performance"])
 @app.get("/")
 def health_check():
     return {"status": "DB connected successfully"}
+if __name__ == "__main__":
+    # Render provides the PORT environment variable. 
+    # Default to 10000 if not found (Render's default).
+    port = int(os.environ.get("PORT", 10000))
+    # host "0.0.0.0" is required to make the server accessible externally
+    uvicorn.run(app, host="0.0.0.0", port=port)
