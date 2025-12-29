@@ -11,6 +11,7 @@ from app.api import stat
 from fastapi.staticfiles import StaticFiles
 import os
 import uvicorn
+from contextlib import asynccontextmanager
 app = FastAPI()
 
 app.add_middleware(
@@ -40,7 +41,18 @@ if not os.path.exists(static_path):
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 print(f"🚀 Server starting. Static files served from: {static_path}")
-Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This runs when the app starts
+    try:
+        print("Connecting to database...")
+        Base.metadata.create_all(bind=engine)
+        print("✅ Database tables synced.")
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+    yield
+    # This runs when the app shuts down
+    pass
 print(f"✅ Static files mounted at: {static_path}")
 app.include_router(users.router)
 app.include_router(auth.router)
