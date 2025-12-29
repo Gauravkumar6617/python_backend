@@ -14,11 +14,17 @@ import uvicorn
 from contextlib import asynccontextmanager
 app = FastAPI()
 
+# In main.py
+origins = [
+    "https://exam-frontend-beige-phi.vercel.app", # No trailing slash
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Vite
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], # Explicitly include OPTIONS
     allow_headers=["*"],
 )
 current_file_path = os.path.abspath(__file__) 
