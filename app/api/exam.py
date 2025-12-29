@@ -6,6 +6,7 @@ import pdfplumber
 import os 
 import io
 import logging
+import re
 from app.services.web_service import extract_text_from_url
 from app.services.gemini_service import generate_questions_stream
 from app.prompts.exam_prompt import exam_prompt
@@ -68,8 +69,7 @@ async def generate_from_pdf(
         generate_questions_stream(pdf_prompt), 
         media_type="text/plain"
     )
-logger = logging.getLogger("exam_processor")
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 def get_diagram_crop(page):
     """Detects only the actual diagram area by filtering out full-page artifacts."""
@@ -113,58 +113,177 @@ def get_diagram_crop(page):
 IMG_DIR = "static/exam_images"
 os.makedirs(IMG_DIR, exist_ok=True)
 
+def normalize_text(text: str) -> str:
+    """Cleans extracted PDF text for better LLM parsing."""
+    text = re.sub(r'\n{2,}', '\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\s+\n', '\n', text)
+    return text.strip()
+
+QUESTION_START_REGEX = re.compile(
+    r'(?m)^(Q\.\d+|\d+[\.\)\s])'
+)
+
+def mark_question_starts(text: str) -> str:
+    """
+    Marks each question with:
+    - @@QUESTION_START@@
+    - @@QIDX:<global_index>@@
+    Works with SSC PDFs where numbering may be 'Q.1', '1.', '1)', or just '1 '
+    """
+    pattern = re.compile(
+        r'(?m)^(?:\s*Q\.\s*|\s*)(\d{1,3})[\.\)]?\s+'
+    )
+
+    counter = 0
+
+    def replacer(match):
+        nonlocal counter
+        counter += 1
+        printed_num = match.group(1)
+        return f"\n@@QUESTION_START@@ @@QIDX:{counter}@@ Q.{printed_num} "
+
+    return pattern.sub(replacer, text)
+
+
+# -------------------------------
+# API Endpoint
+# -------------------------------
+
 @router.post("/api/extract-pyq")
-async def extract_pyq(file: UploadFile = File(...), questions_limit: int = Form(20)):
+async def extract_pyq(
+    file: UploadFile = File(...),
+    questions_limit: int = Form(20),
+    start_at: int = Form(1)
+):
+    """
+    Extracts exactly `questions_limit` MCQs starting from the question
+    labeled with number `start_at`, regardless of section resets.
+    """
+
     pdf_bytes = await file.read()
     raw_text = ""
 
+    # -------------------------------
+    # PDF TEXT EXTRACTION
+    # -------------------------------
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
             text = page.extract_text()
-            if text:
-                # We stop looking for images here and just gather text context
-                raw_text += f"\n--- PAGE {i+1} ---\n{text}"
+            if not text:
+                continue
 
-    # We update the prompt to force TEXTUAL representation of visual logic
+            page_text = normalize_text(text)
+            page_text = mark_question_starts(page_text)
+
+            raw_text += f"\n--- PAGE {i + 1} ---\n{page_text}"
+
+    logger.info(
+        f"🚀 PYQ Extraction | Anchor Q.{start_at} | Limit {questions_limit} | Size {len(raw_text)} chars"
+    )
+
+    # -------------------------------
+    # 🔍 DEBUG 1: DETECT QUESTION LABELS
+    # -------------------------------
+    detected_numbers = re.findall(
+        r'@@QUESTION_START@@\s*(?:Q\.)?(\d{1,3})\b',
+        raw_text
+    )
+
+    unique_numbers = sorted(set(detected_numbers), key=int)
+
+    logger.warning(
+        f"🧩 Detected question numbers (sample): {unique_numbers[:30]} "
+        f"(total={len(unique_numbers)})"
+    )
+
+    # -------------------------------
+    # 🎯 DEBUG 2: CHECK ANCHOR EXISTENCE
+    # -------------------------------
+    anchor_pattern = rf'@@QUESTION_START@@\s*@@QIDX:{start_at}@@'
+    anchor_found = re.search(anchor_pattern, raw_text)
+
+    logger.warning(
+        f"🎯 Anchor @@QUESTION_START@@ Q.{start_at} found: {bool(anchor_found)}"
+    )
+
+    # ❌ FAIL LOUDLY IF ANCHOR NOT FOUND
+    if not anchor_found:
+        logger.error(
+            f"❌ Anchor question Q.{start_at} NOT FOUND in document"
+        )
+        return {
+            "error": f"Anchor question Q.{start_at} not found in PDF",
+            "detected_question_numbers": unique_numbers[:50]
+        }
+
+    # -------------------------------
+    # MASTER EXTRACTION PROMPT (SAFE)
+    # -------------------------------
     extraction_prompt = f"""
-[SYSTEM]: You are a high-precision JSON API. No preamble. No conversational text.
-[TASK]: Convert the provided SSC CGL PDF text into a JSON array of exactly {questions_limit} questions.
+[SYSTEM ROLE]
+You are a deterministic competitive-exam question extractor.
+You NEVER explain.
+You NEVER guess.
+You NEVER hallucinate.
+You ONLY extract what explicitly exists.
 
-[STRICT QUANTITY RULE]:
-- You MUST generate exactly {questions_limit} question objects.
-- DO NOT generate more than {questions_limit} questions, even if the context contains hundreds.
-- If you reach {questions_limit} questions, close the JSON array with ']' and STOP immediately.
+[TASK]
+Extract exactly {questions_limit} multiple-choice questions starting from
+the FIRST question whose numeric label equals {start_at}.
 
-[CRITICAL RULE FOR VISUAL LOGIC]: 
-Convert all non-textual elements (figures, patterns, dice, matrices) into TEXT or ASCII art.
-- Dice: Describe positions, e.g., "Dice Pos 1: Top(6), Front(2), Right(3)".
-- Figure Series: Use ASCII or specific descriptions, e.g., "Step 1: Arrow pointing UP inside a circle -> Step 2: Arrow pointing RIGHT inside a square".
-- Matrices/Grids: Draw using pipes and dashes, e.g., "| 5 | 8 | ? |".
-- Visual Options: If options are figures, describe the differences, e.g., "Option 1: Triangle rotated 90 deg clockwise".
+[QUESTION BOUNDARY — GUARANTEED]
+Every question start is explicitly marked by:
+@@QUESTION_START@@
 
-[OUTPUT SCHEMA]:
+You MUST treat this marker as the ONLY valid question boundary.
+
+[ANCHOR RULE]
+Begin extraction from the question whose @@QIDX equals {start_at}.
+
+[SEQUENCE RULE]
+Continue extracting subsequent @@QUESTION_START@@ blocks
+until exactly {questions_limit} questions are extracted,
+ignoring section headers and numbering resets.
+
+[INVALID FILTER]
+Ignore any question marker not followed by real question text.
+
+[OPTIONS]
+- Exactly 4 options per question
+- Remove option labels (A/B/1/2)
+- Preserve wording exactly
+
+[ANSWER RULE]
+- Use answer ONLY if explicitly present
+- Otherwise:
+  "answer": ""
+  "explanation": ""
+
+[HARD STOP]
+STOP after exactly {questions_limit} questions.
+
+[OUTPUT — JSON ONLY]
 [
   {{
-    "question": "Question text + ASCII diagram if applicable",
-    "options": ["Option 1 content", "Option 2 content", "Option 3 content", "Option 4 content"],
-    "answer": "Option X",
-    "explanation": "Brief logical derivation"
+    "question": "Exact question text",
+    "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+    "answer": "",
+    "explanation": ""
   }}
 ]
 
-[CONTEXT]: 
-{raw_text[:700000]}
+[DOCUMENT TEXT]
+{raw_text}
 """
-    logger.info(f"🚀 Starting textual extraction for {questions_limit} questions")
-    logger.debug(f"Raw text length: {len(raw_text)} characters")
 
-# Log a snippet of the prompt to confirm no-image instructions are present
-    logger.info(f"Prompt instruction check: {'NO IMAGES' in extraction_prompt}")
+    logger.info(f"📦 Prompt size sent to LLM: {len(extraction_prompt)} chars")
 
     return StreamingResponse(
-    generate_questions_stream(extraction_prompt),
-    media_type="text/plain"
-)
+        generate_questions_stream(extraction_prompt),
+        media_type="application/json"
+    )
+
 
 @router.post("/generate-from-web")
 async def generate_from_web(request: ExamRequest): # Reuse your existing Pydantic model
